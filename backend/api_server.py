@@ -9,7 +9,7 @@ from __future__ import annotations
 import hmac
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import wraps
 from urllib.parse import urlparse
 
@@ -21,11 +21,12 @@ from groq import RateLimitError
 load_dotenv()
 
 from controllers.news_controller import LAST_RUN, RSS_FEEDS, start_auto_fetch
+from services import briefing_service
 from models.news_article import NewsArticle
-from services.search_service import search_news
+from services.search_service import match_feeds, search_news, warm_cache
 from services.firebase_service import insert_article, is_duplicate, delete_article, list_articles, update_summary
 from services.groq_service import GroqService, InsufficientContentError
-from services.rss_utils import clean_html
+from services.rss_utils import SHORT_CONTENT, clean_html, fetch_article_text
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,12 @@ CORS(app, origins=os.environ.get("CORS_ORIGINS", "http://localhost:5173,http://1
 API_TOKEN = os.environ.get("API_TOKEN", "")
 CATEGORIES = {f["category"] for f in RSS_FEEDS}
 MAX_SUMMARY_INPUT = 20_000  # ตัวอักษร — กันข้อความยาวผิดปกติเผาโควตา Groq
+MAX_ASK_CONTEXT = 6_000     # ตัวอักษร (~1,500 token) — เนื้อข่าวที่ส่งไปพร้อมคำถาม (Groq ฟรีจำกัด 8,000 token/นาที)
+MAX_QUESTION = 300
+MAX_TOPICS = 10
 FETCH_INTERVAL_MINUTES = float(os.environ.get("FETCH_INTERVAL_MINUTES", "30"))  # 0 = ไม่ดึงข่าวอัตโนมัติ
+# เว็บที่ backend ยอมเปิดหน้าข่าวไปดึงเนื้อหาเต็ม — เฉพาะสำนักข่าวใน RSS_FEEDS
+ARTICLE_HOSTS = {urlparse(f["url"]).hostname for f in RSS_FEEDS}
 
 _groq: GroqService | None = None
 
@@ -68,11 +74,40 @@ def _http_url(value) -> str | None:
     return url if urlparse(url).scheme in ("http", "https") else None
 
 
+def _can_fetch_text(url) -> bool:
+    """เปิดหน้าข่าวไปดึงเนื้อหาเต็มได้ไหม — URL มาจาก client จึงยอมเฉพาะเว็บใน ARTICLE_HOSTS
+    ไม่ให้ใช้ API นี้สั่ง backend เปิดเว็บอื่นหรือเครื่องในวงแลน"""
+    if not isinstance(url, str):
+        return False
+    parsed = urlparse(url)
+    return parsed.scheme in ("http", "https") and parsed.hostname in ARTICLE_HOSTS
+
+
 def _with_summary_flag(articles: list[dict]) -> list[dict]:
-    """บอก frontend ว่าข่าวไหนมีเนื้อหาพอให้ AI สรุป (เช่นข่าว Google News มีแค่หัวข้อ) จะได้ซ่อนปุ่มสรุป"""
+    """บอก frontend ว่าข่าวไหนสรุปได้ จะได้ซ่อนปุ่มสรุปของข่าวที่มีแค่หัวข้อ (เช่น Google News)
+    ข่าวจากสำนักใน RSS_FEEDS สรุปได้เสมอ — ถ้าเนื้อหาสั้น ตอนกดสรุปจะไปดึงเนื้อหาเต็มจากหน้าข่าวให้"""
     for a in articles:
-        a["can_summarize"] = len(clean_html(a.get("full_content"))) >= GroqService.MIN_CONTENT_LENGTH
+        a["can_summarize"] = (len(clean_html(a.get("full_content"))) >= GroqService.MIN_CONTENT_LENGTH
+                              or _can_fetch_text(a.get("source_url")))
     return articles
+
+
+def _article_input(data: dict) -> tuple[str, str]:
+    """หัวข่าวและเนื้อหาที่จะส่งให้ AI (ตัด HTML แล้ว — ข่าวเก่าใน Firestore ยังมี HTML ปนอยู่)
+    RSS บางสำนัก (เช่นไทยรัฐ) ให้แค่เกริ่นนำ — ถ้าเนื้อหาสั้นจะเปิดหน้าข่าวเอาเนื้อหาเต็มมาแทน"""
+    title = clean_html(data["title"]) if isinstance(data.get("title"), str) else ""
+    content = clean_html(data["content"]) if isinstance(data.get("content"), str) else ""
+    if len(content) < SHORT_CONTENT and _can_fetch_text(data.get("source_url")):
+        content = max(content, fetch_article_text(data["source_url"]), key=len)
+    return title, content
+
+
+def _history(value) -> list[tuple[str, str]]:
+    """คำถาม-คำตอบ 2 รอบล่าสุด ให้ AI เข้าใจคำถามต่อเนื่อง เช่น "แล้วเขาเป็นใคร" """
+    if not isinstance(value, list):
+        return []
+    pairs = [(_text(h.get("question"), MAX_QUESTION), _text(h.get("answer"), 1_000)) for h in value if isinstance(h, dict)]
+    return [(q, a) for q, a in pairs if q and a][-2:]
 
 
 def _article_from_request(data: dict) -> NewsArticle:
@@ -92,6 +127,12 @@ def _article_from_request(data: dict) -> NewsArticle:
         published_at = datetime.fromisoformat(data["published_at"])
     except (KeyError, TypeError, ValueError):
         published_at = None
+    if published_at is not None:
+        # เก็บเป็น UTC เหมือนข่าวจาก RSS — ไม่มี timezone ถือเป็นเวลาไทย (เวลาแบบมี/ไม่มี timezone ปนกันจะเทียบกันไม่ได้)
+        # และ Firestore เรียง published_at แบบข้อความ ทุกข่าวต้องเป็น timezone เดียวกันถึงจะเรียงถูก
+        if published_at.tzinfo is None:
+            published_at = published_at.replace(tzinfo=briefing_service.BANGKOK)
+        published_at = published_at.astimezone(timezone.utc)
 
     return NewsArticle(
         title         = title,
@@ -124,15 +165,83 @@ def status():
     return jsonify({"auto_fetch_minutes": FETCH_INTERVAL_MINUTES, "last_fetch": LAST_RUN})
 
 
+# ── GET /api/briefing ─────────────────────────────────────────────────────────
+@app.route("/api/briefing")
+def briefing():
+    try:
+        return jsonify({"briefing": briefing_service.latest()})
+    except Exception:
+        logger.exception("โหลดสรุปข่าวเด่นไม่สำเร็จ")
+        return jsonify({"error": "โหลดสรุปข่าวเด่นไม่สำเร็จ ลองใหม่อีกครั้ง"}), 500
+
+
+# ── POST /api/briefing ── สร้างสรุปข่าวเด่นใหม่ทันที (ปกติ backend สร้างเองทุก ~3 ชั่วโมง) ──
+@app.route("/api/briefing", methods=["POST"])
+@require_token
+def create_briefing():
+    try:
+        result = briefing_service.generate()
+    except briefing_service.BriefingBusyError:
+        return jsonify({"error": "กำลังสร้างสรุปข่าวเด่นอยู่ รอสักครู่"}), 409
+    except EnvironmentError:
+        return jsonify({"error": "ยังไม่ได้ตั้ง GROQ_API_KEY ใน backend/.env"}), 500
+    except RateLimitError:
+        return jsonify({"error": "ใช้โควตา AI เต็มแล้ว รอสักครู่แล้วลองใหม่"}), 429
+    except Exception:
+        logger.exception("สร้างสรุปข่าวเด่นไม่สำเร็จ")
+        return jsonify({"error": "สร้างสรุปข่าวเด่นไม่สำเร็จ ลองใหม่อีกครั้ง"}), 502
+    if result is None:
+        return jsonify({"error": "ข่าวใน 24 ชั่วโมงล่าสุดยังไม่พอให้สรุป"}), 422
+    return jsonify({"briefing": result})
+
+
 # ── GET /api/search?q=keyword ─────────────────────────────────────────────────
 @app.route("/api/search")
 def search():
-    keyword = request.args.get("q", "").strip()
+    keyword = request.args.get("q", "").strip()[:100]
     if not keyword:
         return jsonify({"error": "กรุณาพิมพ์คำที่ต้องการค้นหา"}), 400
 
-    results = _with_summary_flag(search_news(keyword, max_results=20))
+    results = _with_summary_flag(search_news(keyword))
     return jsonify({"results": results, "count": len(results)})
+
+
+# ── GET /api/topics?q=ราคาทอง&q=เอเชียนเกมส์ ─────────────────────────────────────
+# ข่าวล่าสุดของหัวข้อที่ติดตาม — ค้นจาก cache ของ feed เท่านั้น (ไม่อ่าน Firestore ไม่เรียก Google) หน้าเว็บจึงเช็กบ่อย ๆ ได้
+@app.route("/api/topics")
+def topics():
+    names = [_text(t, 50) for t in request.args.getlist("q")]
+    names = list(dict.fromkeys(n for n in names if n))[:MAX_TOPICS]
+    return jsonify({"results": {name: _with_summary_flag(match_feeds(name)) for name in names}})
+
+
+# ── POST /api/ask ─────────────────────────────────────────────────────────────
+# body: {"title", "content", "source_url", "question", "history": [{"question", "answer"}, ...]}
+@app.route("/api/ask", methods=["POST"])
+@require_token
+def ask():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    question = _text(data.get("question"), MAX_QUESTION)
+    if not question:
+        return jsonify({"error": "กรุณาพิมพ์คำถาม"}), 400
+    title, content = _article_input(data)
+    if len(content) < GroqService.MIN_CONTENT_LENGTH:
+        return jsonify({"error": "ข่าวนี้มีเนื้อหาไม่พอให้ AI ตอบคำถาม"}), 422
+
+    try:
+        groq = get_groq()
+    except EnvironmentError:
+        return jsonify({"error": "ยังไม่ได้ตั้ง GROQ_API_KEY ใน backend/.env"}), 500
+    try:
+        answer = groq.ask(title, content[:MAX_ASK_CONTEXT], question, _history(data.get("history")))
+    except RateLimitError:
+        return jsonify({"error": "ใช้โควตา AI เต็มแล้ว รอสักครู่แล้วลองใหม่"}), 429
+    except Exception:
+        logger.exception("ถาม AI ไม่สำเร็จ")
+        return jsonify({"error": "AI ตอบไม่สำเร็จ ลองใหม่อีกครั้ง"}), 502
+    return jsonify({"answer": answer})
 
 
 # ── POST /api/summarize ───────────────────────────────────────────────────────
@@ -143,9 +252,8 @@ def summarize():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         data = {}
-    parts = [data.get("title"), data.get("content")]
-    # ข่าวเก่าใน Firestore ยังมี HTML ปนอยู่ — ตัดทิ้งก่อนส่งให้ AI
-    text = clean_html("\n\n".join(p for p in parts if isinstance(p, str) and p))[:MAX_SUMMARY_INPUT]
+    title, content = _article_input(data)
+    text = "\n".join(p for p in (title, content) if p)[:MAX_SUMMARY_INPUT]
 
     try:
         groq = get_groq()
@@ -205,9 +313,11 @@ if __name__ == "__main__":
     # debug=True เปิด Werkzeug debugger ที่สั่งรันโค้ดบนเครื่องได้ — เปิดเฉพาะตอนพัฒนาด้วย FLASK_DEBUG=1
     # และห้ามใช้คู่กับ API_HOST=0.0.0.0 (คนในวงแลนเดียวกันจะเข้าถึง debugger ได้)
     debug = os.environ.get("FLASK_DEBUG") == "1"
-    # debug mode รันไฟล์นี้ 2 โปรเซส (ตัวเฝ้าไฟล์ + ตัวรับ request) — เริ่มตัวดึงข่าวเฉพาะตัวรับ request จะได้ไม่ดึงซ้ำ
-    if FETCH_INTERVAL_MINUTES > 0 and (not debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true"):
-        start_auto_fetch(FETCH_INTERVAL_MINUTES)
+    # debug mode รันไฟล์นี้ 2 โปรเซส (ตัวเฝ้าไฟล์ + ตัวรับ request) — งานเบื้องหลังเริ่มเฉพาะตัวรับ request จะได้ไม่ทำซ้ำ
+    if not debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        warm_cache()  # โหลด feed ของหน้าค้นหาไว้ก่อน คนแรกที่ค้นจะได้ไม่ต้องรอ
+        if FETCH_INTERVAL_MINUTES > 0:
+            start_auto_fetch(FETCH_INTERVAL_MINUTES)
     app.run(
         host=os.environ.get("API_HOST", "127.0.0.1"),
         port=5000,

@@ -1,15 +1,17 @@
 """
 services/rss_utils.py
-Helper สำหรับอ่านข้อมูลจาก RSS entry (ใช้ร่วมกันระหว่าง news_controller และ search_service)
+Helper สำหรับอ่านข้อมูลจาก RSS entry และหน้าข่าว (ใช้ร่วมกันระหว่าง news_controller, search_service และ api_server)
 """
 
 from __future__ import annotations
 import html
+import json
 import re
-import urllib.parse
 import urllib.request
 
 import feedparser
+
+SHORT_CONTENT = 400  # ตัวอักษร — เนื้อหาใน RSS ที่สั้นกว่านี้เป็นแค่เกริ่นนำ (เช่นไทยรัฐ) ต้องไปดึงเนื้อหาเต็มจากหน้าข่าว
 
 _IMG_TAG = re.compile(r"<img[^>]+src=[\"']([^\"']+)")
 _OG_IMAGE = re.compile(
@@ -25,6 +27,10 @@ _FEED_HEADERS = {**_BROWSER_HEADERS, "Accept": "application/rss+xml,application/
 _SCRIPT_TAG = re.compile(r"<(script|style)\b.*?</\1>", re.I | re.S)
 _BLOCK_END = re.compile(r"</(p|div|h[1-6]|li|blockquote|figcaption)>|<br\s*/?>", re.I)
 _ANY_TAG = re.compile(r"<[^>]+>")
+_LD_JSON = re.compile(r"<script[^>]+application/ld\+json[^>]*>(.*?)</script>", re.S | re.I)
+_NEXT_PUSH = re.compile(r'self\.__next_f\.push\(\[1,("(?:[^"\\]|\\.)*")\]\)', re.S)
+_FLIGHT_TEXT_ROW = re.compile(rb"(?:^|\n)[0-9a-z]+:T([0-9a-f]+),")
+_FLIGHT_CONTENT = re.compile(r'"content":\s*("(?:[^"\\]|\\.)*")')
 
 
 def clean_html(text: str | None) -> str:
@@ -63,16 +69,68 @@ def extract_image(entry) -> str | None:
     return m.group(1) if m else None
 
 
-def fetch_og_image(page_url: str, timeout: float = 10) -> str | None:
-    """สำรองเมื่อ RSS ไม่มีรูป: เปิดหน้าข่าวแล้วอ่าน <meta property="og:image">"""
-    # og:image ของ Google News เป็นแค่โลโก้ Google ไม่ใช่รูปข่าว
-    if urllib.parse.urlparse(page_url).netloc.endswith("news.google.com"):
-        return None
+def fetch_page(page_url: str, timeout: float = 10, max_bytes: int = 2_000_000) -> str | None:
+    """โหลด HTML ของหน้าข่าว — คืน None ถ้าโหลดไม่ได้"""
     try:
         req = urllib.request.Request(page_url, headers=_BROWSER_HEADERS)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            html = resp.read(300_000).decode("utf-8", "ignore")
+            return resp.read(max_bytes).decode("utf-8", "ignore")
     except Exception:
         return None
-    m = _OG_IMAGE.search(html)
+
+
+def extract_og_image(page_html: str) -> str | None:
+    """รูปสำรองเมื่อ RSS ไม่มีรูป: <meta property="og:image">"""
+    m = _OG_IMAGE.search(page_html)
     return (m.group(1) or m.group(2)) if m else None
+
+
+def extract_article_text(page_html: str) -> str:
+    """เนื้อข่าวเต็มจากหน้าข่าว (ตัด HTML แล้ว) — คืน "" ถ้าหาไม่เจอ
+    1. JSON-LD NewsArticle.articleBody ที่เว็บข่าวใส่ไว้ให้ search engine (เช่นไทยรัฐ ข่าวทั่วไป/บันเทิง)
+    2. ข้อมูลของ Next.js ใน self.__next_f.push(...) สำหรับหน้าที่ไม่มี JSON-LD (เช่นไทยรัฐ กีฬา)"""
+    return max((clean_html(t) for t in (_ld_json_article_body(page_html), _next_flight_text(page_html))), key=len)
+
+
+def fetch_article_text(page_url: str, timeout: float = 10) -> str:
+    page = fetch_page(page_url, timeout)
+    return extract_article_text(page) if page else ""
+
+
+def _ld_json_article_body(page_html: str) -> str:
+    for blob in _LD_JSON.findall(page_html):
+        try:
+            # raw_decode อ่านแค่ object แรก — บางเว็บมีข้อความเกินต่อท้ายจน json.loads error
+            data, _ = json.JSONDecoder().raw_decode(blob.strip())
+        except ValueError:
+            continue
+        if isinstance(data, dict):
+            data = data.get("@graph", [data])
+        for item in data if isinstance(data, list) else []:
+            body = item.get("articleBody") if isinstance(item, dict) else None
+            if isinstance(body, str) and body.strip():
+                return body
+    return ""
+
+
+def _next_flight_text(page_html: str) -> str:
+    """Next.js (app router) เก็บข้อมูลหน้าไว้ใน self.__next_f.push(...) — เนื้อข่าวอยู่ได้ 2 แบบ
+    - ข้อความยาวแยกเป็นแถว "<id>:T<ความยาวเป็น byte แบบ hex>,<HTML>"
+    - ข้อความที่ไม่ยาวมากอยู่ในฟิลด์ "content" ของ JSON ตรง ๆ
+    เลือก HTML (มี <p>) ที่ยาวที่สุด"""
+    payload = []
+    for chunk in _NEXT_PUSH.findall(page_html):
+        try:
+            payload.append(json.loads(chunk))
+        except ValueError:
+            continue
+    text = "".join(payload)
+    data = text.encode("utf-8")
+    candidates = [data[m.end(): m.end() + int(m.group(1), 16)].decode("utf-8", "ignore")
+                  for m in _FLIGHT_TEXT_ROW.finditer(data)]
+    for m in _FLIGHT_CONTENT.finditer(text):
+        try:
+            candidates.append(json.loads(m.group(1)))
+        except ValueError:
+            continue
+    return max((c for c in candidates if "<p" in c), key=len, default="")

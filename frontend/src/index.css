@@ -1,22 +1,50 @@
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body {
-  width: 100%;
-  background: #f8f9fa;
-  font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans Thai", "Leelawadee UI", Tahoma, sans-serif;
-}
-#root { width: 100%; }
-button, input { font: inherit; }
+@import "tailwindcss";
 
-.header-inner { padding: 16px 24px 0; }
-.page { padding: 24px; }
-/* min(280px, 100%) — จอแคบกว่า 280px การ์ดจะหดตามจอแทนที่จะล้นออกด้านข้าง */
-.news-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr));
-  gap: 16px;
+/* แนวคิด: "ข่าวที่ AI ขีดเน้นให้แล้ว" — หมึกปากกาน้ำเงินเป็นสีหลัก ปากกาเน้นข้อความสีเหลืองใช้เฉพาะกับสิ่งที่ AI ทำ
+   ตั้งค่าในนี้แล้วใช้เป็น class ของ Tailwind ได้ เช่น text-ink, bg-marker, border-line, font-read */
+@theme {
+  /* พาดหัว/เมนูใช้ตัวไม่มีหัว ข้อความที่ต้องอ่านยาว (สรุปของ AI) ใช้ตัวมีหัวแบบตำราเรียน */
+  --font-sans: "Bai Jamjuree", system-ui, "Segoe UI", "Leelawadee UI", Tahoma, sans-serif;
+  --font-read: "IBM Plex Sans Thai Looped", "Noto Sans Thai Looped", "Leelawadee UI", Tahoma, sans-serif;
+
+  --color-paper: #f3f5f8;       /* พื้นหลังเว็บ */
+  --color-ink: #1b2559;         /* หมึกปากกาน้ำเงิน — พาดหัว, ปุ่มหลัก */
+  --color-ink-deep: #121a45;
+  --color-graphite: #2b3140;    /* เนื้อความ */
+  --color-muted: #5b6475;       /* ข้อความรอง (contrast 6:1) */
+  --color-faint: #6b7385;       /* เวลา, คำอธิบายเล็ก (contrast 4.8:1) */
+  --color-line: #e2e6ec;
+  --color-line-strong: #c9d0da;
+  --color-wash: #eef1f6;        /* พื้นช่องรูป, hover */
+  --color-pen: #2f4bd8;         /* ลิงก์, กรอบ focus */
+  --color-marker: #ffe45c;      /* ปากกาเน้นข้อความ — สีของ AI */
+  --color-marker-deep: #ffd82e;
+  --color-red: #d8332b;         /* ป้าย "ใหม่", ตัวเลขข่าวใหม่ */
+  --color-red-deep: #b3261e;    /* ข้อความ error */
+  --color-red-soft: #fdecea;
+
+  --shadow-lift: 0 8px 24px -10px rgb(27 37 89 / 0.35);
+
+  /* แถบไฮไลต์ปาดจากซ้ายไปขวา ตอนข้อสรุปของ AI ขึ้น */
+  --animate-marker: marker-sweep 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  @keyframes marker-sweep {
+    from { background-size: 0% 100%; }
+  }
 }
 
-@media (max-width: 480px) {
-  .header-inner { padding: 12px 16px 0; }
-  .page { padding: 16px; }
+/* แถบปากกาเน้นข้อความครึ่งล่างของตัวอักษร — ขึ้นบรรทัดใหม่ก็ขีดต่อทุกบรรทัด */
+@utility highlight {
+  background-image: linear-gradient(transparent 52%, var(--color-marker) 52%, var(--color-marker) 92%, transparent 92%);
+  background-repeat: no-repeat;
+  background-size: 100% 100%;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+@layer base {
+  body { background-color: var(--color-paper); color: var(--color-graphite); }
+  /* Tailwind v4 ให้ปุ่มใช้ cursor ปกติ — ปุ่มที่กดได้ให้เป็นรูปมือ */
+  button:not(:disabled) { cursor: pointer; }
+  /* ใช้คีย์บอร์ด (Tab) แล้วต้องเห็นว่าอยู่ตรงไหน */
+  :focus-visible { outline: 2px solid var(--color-pen); outline-offset: 2px; }
 }

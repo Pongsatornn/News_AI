@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import os
 import sys
 import threading
 import time
@@ -14,9 +15,14 @@ if not __package__:
     # รันเป็นไฟล์ตรง ๆ (python controllers/news_controller.py) — เพิ่มโฟลเดอร์ backend ให้ import models/services เจอ
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from groq import RateLimitError
+
 from models.news_article import NewsArticle
-from services.firebase_service import is_duplicate, insert_article
-from services.rss_utils import clean_html, extract_image, fetch_feed, fetch_og_image
+from services import briefing_service
+from services.firebase_service import insert_article, is_duplicate, update_summary
+from services.groq_service import GroqService, InsufficientContentError
+from services.rss_utils import (SHORT_CONTENT, clean_html, extract_article_text, extract_image,
+                                extract_og_image, fetch_feed, fetch_page)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
@@ -41,13 +47,21 @@ RSS_FEEDS = [
 ]
 
 MAX_PER_CATEGORY = 20   # ข่าวใหม่สูงสุดต่อหมวดต่อรอบ — ทุกสำนักในหมวดผลัดกันได้ทีละข่าว
+MAX_READ_ERRORS = 5     # เช็กข่าวซ้ำใน Firestore พลาดครบเท่านี้ในรอบเดียว = Firestore น่าจะล่ม หยุดรอบนี้
+
+# ให้ AI สรุปข่าวใหม่รอไว้ — Groq แบบฟรีจำกัด 1,000 ครั้ง/วัน และ 8,000 token/นาที
+# 5 ข่าว × 48 รอบ/วัน = 240 ครั้ง ที่เหลือไว้ให้ผู้ใช้กดสรุปเอง
+AUTO_SUMMARY_PER_RUN = int(os.environ.get("AUTO_SUMMARY_PER_RUN", "5"))  # 0 = ปิด
+AUTO_SUMMARY_INPUT = 3000   # ตัวอักษร (~1,000 token)
+AUTO_SUMMARY_DELAY = 20     # วินาทีระหว่างแต่ละข่าว — เหลือโควตาต่อนาทีให้ผู้ใช้กดสรุปได้ระหว่างนั้น
+BRIEFING_INTERVAL_HOURS = float(os.environ.get("BRIEFING_INTERVAL_HOURS", "3"))  # 0 = ไม่สร้างเอง
 
 # URL ที่รู้แล้วว่ามีใน Firestore — รอบถัดไปไม่ต้องอ่าน Firestore ซ้ำ (ประหยัดโควตาตอนดึงอัตโนมัติ)
 _known_urls: set[str] = set()
 _MAX_KNOWN_URLS = 20_000
 
 # สถานะรอบล่าสุด — /api/status ส่งให้ frontend รู้ว่ามีข่าวใหม่เข้ามาแล้ว
-LAST_RUN = {"running": False, "finished_at": None, "new_count": 0}
+LAST_RUN = {"running": False, "finished_at": None, "new_count": 0, "summarized": 0}
 
 
 def _remember(url: str) -> None:
@@ -65,19 +79,70 @@ def _is_known(url: str) -> bool:
     return False
 
 
+def _newest_first_by_category(articles: list[NewsArticle]) -> list[NewsArticle]:
+    """เรียงข่าวใหม่ก่อน แล้วสลับหมวดทีละข่าว — ทุกหมวดได้สรุปก่อนที่หมวดไหนจะได้ข่าวที่สอง"""
+    oldest = datetime.min.replace(tzinfo=timezone.utc)
+    queues: dict[str, list[NewsArticle]] = {}
+    for a in sorted(articles, key=lambda a: a.published_at or oldest, reverse=True):
+        queues.setdefault(a.category, []).append(a)
+    ordered = []
+    while any(queues.values()):
+        for queue in queues.values():
+            if queue:
+                ordered.append(queue.pop(0))
+    return ordered
+
+
 class NewsController:
+    def __init__(self):
+        self._new_articles: list[NewsArticle] = []
+        self._read_errors = 0
+
     def run(self) -> int:
         LAST_RUN["running"] = True
-        total_new = 0
+        total_new = summarized = 0
         try:
-            for category in dict.fromkeys(f["category"] for f in RSS_FEEDS):
+            # feed ทั่วไปมีข่าวทุกหมวดปนอยู่ — ดึงหมวดเฉพาะก่อน ข่าวที่อยู่หลาย feed จะได้หมวดที่ตรงที่สุด
+            categories = sorted(dict.fromkeys(f["category"] for f in RSS_FEEDS), key=lambda c: c == "general")
+            for category in categories:
                 feeds = [f for f in RSS_FEEDS if f["category"] == category]
                 total_new += self._process_category(category, feeds)
+            summarized = self._auto_summarise()
         finally:
-            LAST_RUN.update(running=False, new_count=total_new,
+            LAST_RUN.update(running=False, new_count=total_new, summarized=summarized,
                             finished_at=datetime.now(timezone.utc).isoformat())
-        logger.info("เสร็จสิ้น — บันทึกข่าวใหม่ %d ข่าว", total_new)
+        logger.info("เสร็จสิ้น — บันทึกข่าวใหม่ %d ข่าว, AI สรุปรอไว้ %d ข่าว", total_new, summarized)
         return total_new
+
+    def _auto_summarise(self) -> int:
+        """ให้ AI สรุปข่าวใหม่รอไว้ ผู้ใช้กดแล้วอ่านได้ทันที — สลับหมวดทีละข่าว ข่าวใหม่ก่อน
+        จำกัดรอบละ AUTO_SUMMARY_PER_RUN ข่าวและเว้นระยะ ไม่ให้ใช้โควตา Groq จนผู้ใช้กดสรุปเองไม่ได้"""
+        candidates = [a for a in self._new_articles if len(a.full_content or "") >= GroqService.MIN_CONTENT_LENGTH]
+        if AUTO_SUMMARY_PER_RUN <= 0 or not candidates:
+            return 0
+        try:
+            groq = GroqService()
+        except EnvironmentError:
+            logger.warning("ยังไม่ได้ตั้ง GROQ_API_KEY — ข้ามการสรุปรอไว้")
+            return 0
+
+        done = 0
+        for i, article in enumerate(_newest_first_by_category(candidates)[:AUTO_SUMMARY_PER_RUN]):
+            if i:
+                time.sleep(AUTO_SUMMARY_DELAY)
+            try:
+                summary = groq.summarise(f"{article.title}\n{article.full_content}"[:AUTO_SUMMARY_INPUT])
+            except InsufficientContentError:
+                continue
+            except RateLimitError:
+                logger.warning("โควตา Groq เต็ม — หยุดสรุปรอไว้รอบนี้")
+                break
+            except Exception:
+                logger.exception("สรุปรอไว้ไม่สำเร็จ: %s", article.title[:60])
+                continue
+            if update_summary(article.id, summary):
+                done += 1
+        return done
 
     def _process_category(self, category, feeds):
         """ดึงทุก feed ในหมวดแล้วผลัดกันเอาข่าวใหม่ทีละข่าว — ถ้าวนทีละ feed สำนักแรกจะใช้โควตาหมวดหมดทุกรอบ"""
@@ -107,13 +172,40 @@ class NewsController:
     def _next_new_article(self, entries, cfg):
         for entry in entries:
             article = self._entry_to_article(entry, cfg["source"], cfg["category"])
-            if article is not None and not _is_known(article.source_url):
+            if article is None:
+                continue
+            try:
+                known = _is_known(article.source_url)
+            except Exception as e:
+                # อ่าน Firestore พลาด — ข้ามข่าวนี้ไปก่อน (ยังไม่จำ URL ไว้ รอบหน้าจะลองใหม่)
+                # ถ้าพลาดหลายครั้งแปลว่า Firestore น่าจะล่ม หยุดรอบนี้เลย ไม่ต้องรอ timeout ทีละข่าว
+                self._read_errors += 1
+                logger.error("เช็กข่าวซ้ำไม่สำเร็จ: %s", e)
+                if self._read_errors >= MAX_READ_ERRORS:
+                    raise
+                continue
+            if not known:
                 return article
         return None
 
+    def _fill_from_page(self, article) -> None:
+        """RSS ไม่มีรูปหรือมีแค่เกริ่นนำ (เช่นไทยรัฐ) → เปิดหน้าข่าวครั้งเดียว เอาทั้งรูปและเนื้อหาเต็ม
+        ทำเฉพาะข่าวใหม่ที่กำลังจะบันทึก จะได้ไม่ช้า"""
+        short = len(article.full_content or "") < SHORT_CONTENT
+        if article.image_url and not short:
+            return
+        page = fetch_page(article.source_url)
+        if not page:
+            return
+        if not article.image_url:
+            article.image_url = extract_og_image(page)
+        if short:
+            text = extract_article_text(page)
+            if len(text) > len(article.full_content or ""):
+                article.full_content = text
+
     def _save(self, article) -> bool:
-        if not article.image_url:  # เปิดหน้าข่าวเฉพาะข่าวใหม่ที่ RSS ไม่มีรูป จะได้ไม่ช้า
-            article.image_url = fetch_og_image(article.source_url)
+        self._fill_from_page(article)
         try:
             created = insert_article(article.to_dict())
         except Exception as e:
@@ -122,6 +214,7 @@ class NewsController:
         _remember(article.source_url)
         if created:
             logger.info("บันทึก: [%s] %s", article.source, article.title[:60])
+            self._new_articles.append(article)
         return created
 
     def _entry_to_article(self, entry, source, category):
@@ -142,6 +235,18 @@ class NewsController:
             return None
 
 
+def _refresh_briefing() -> None:
+    """สร้างสรุปข่าวเด่นใหม่ถ้าของเดิมเก่ากว่า BRIEFING_INTERVAL_HOURS (หรือยังไม่มี)"""
+    if BRIEFING_INTERVAL_HOURS <= 0 or not briefing_service.is_stale(BRIEFING_INTERVAL_HOURS):
+        return
+    if LAST_RUN.get("summarized"):
+        time.sleep(60)  # เพิ่งสรุปรอไว้ไป — รอให้โควตา token ต่อนาทีของ Groq ฟื้นก่อน
+    try:
+        briefing_service.generate()
+    except briefing_service.BriefingBusyError:
+        pass
+
+
 def start_auto_fetch(interval_minutes: float) -> threading.Thread:
     """ดึงข่าวทันที แล้วดึงซ้ำทุก interval_minutes นาทีใน background thread (daemon — ปิดไปพร้อม server)"""
     def loop():
@@ -150,6 +255,10 @@ def start_auto_fetch(interval_minutes: float) -> threading.Thread:
                 NewsController().run()
             except Exception:
                 logger.exception("ดึงข่าวอัตโนมัติไม่สำเร็จ — จะลองใหม่รอบหน้า")
+            try:
+                _refresh_briefing()
+            except Exception:
+                logger.exception("สร้างสรุปข่าวเด่นไม่สำเร็จ — จะลองใหม่รอบหน้า")
             time.sleep(interval_minutes * 60)
 
     thread = threading.Thread(target=loop, name="auto-fetch", daemon=True)

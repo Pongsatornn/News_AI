@@ -1,16 +1,27 @@
-# React + Vite
+# NewsAI — frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+หน้าเว็บ React + Vite + Tailwind CSS v4 ของ NewsAI วิธีติดตั้งและรันทั้งระบบอยู่ใน [README.md ของโฟลเดอร์หลัก](../README.md)
 
-Currently, two official plugins are available:
+## การเขียน style
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- ใช้ class ของ Tailwind ใน `className` ไม่ใช้ inline `style={{...}}`
+- สีของเว็บตั้งไว้ใน `@theme` ของ [src/index.css](src/index.css) ใช้ชื่อตามหน้าที่ ถ้าจะเปลี่ยนสีทั้งเว็บให้แก้ที่นี่ที่เดียว:
+  - `ink`: หมึกปากกาน้ำเงิน ใช้กับพาดหัวและปุ่มหลัก
+  - `marker`: ปากกาเน้นข้อความสีเหลือง **ใช้เฉพาะกับสิ่งที่ AI ทำ** เช่นปุ่มสรุป/ถาม และข้อความที่ AI สรุป
+  - `graphite` / `muted` / `faint`: สีข้อความ จากเข้มไปอ่อน
+  - `line`: เส้นขอบ
+  - `pen`: ลิงก์และกรอบ focus
+  - `red` / `red-deep`: ป้าย "ใหม่" และ error
+- ฟอนต์: `font-sans` (Bai Jamjuree) เป็นค่าเริ่มต้นสำหรับพาดหัวและเมนู ส่วนข้อความที่อ่านยาวใส่ `font-read` (IBM Plex Sans Thai Looped) โหลดจาก Google Fonts ใน [index.html](index.html)
+- `highlight` คือแถบปากกาเน้นข้อความใต้ตัวอักษร (ประกาศด้วย `@utility` ใน index.css) ใช้คู่กับ `motion-safe:animate-marker` ถ้าต้องการให้ปาดเข้ามา
+- class ชุดที่ใช้ซ้ำหลายที่ (เช่น `NEWS_GRID`, `INPUT`, `AI_BTN`, `INK_BTN`) เก็บเป็นค่าคงที่ไว้ด้านบนของ [src/App.jsx](src/App.jsx)
+- แนะนำให้ติดตั้ง extension "Tailwind CSS IntelliSense" ใน VS Code จะได้ autocomplete ของ class และหายเตือน `Unknown at rule @theme`
 
-## React Compiler
+| คำสั่ง | ใช้ทำอะไร |
+|---|---|
+| `npm run dev` | เปิด dev server ที่ http://localhost:5173 |
+| `npm run lint` | ตรวจโค้ดด้วย ESLint |
+| `npm run build` | build ไฟล์เว็บลง `dist/` |
+| `npm run preview` | เปิดดูเว็บที่ build แล้ว |
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+ต้องมี `frontend/.env` ที่ใส่ `VITE_API_TOKEN` ให้ตรงกับ `API_TOKEN` ใน `backend/.env`

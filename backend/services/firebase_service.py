@@ -79,3 +79,14 @@ def list_articles(category: str | None = None, limit: int = 100) -> list[dict]:
     articles = [{**d.to_dict(), "id": d.id} for d in docs]
     articles.sort(key=lambda a: a.get("published_at") or "", reverse=True)
     return articles[:limit]
+
+def _briefings():
+    return get_db().collection("briefings")
+
+def save_briefing(briefing: dict) -> None:
+    """สรุปข่าวเด่นเก็บ document ละวัน — สร้างใหม่ในวันเดียวกันจะเขียนทับของเดิม"""
+    _briefings().document(briefing["date"]).set(briefing)
+
+def latest_briefing() -> dict | None:
+    docs = _briefings().order_by("generated_at", direction=firestore.Query.DESCENDING).limit(1).get()
+    return docs[0].to_dict() if docs else None
