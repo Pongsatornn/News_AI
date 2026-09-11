@@ -38,7 +38,8 @@ class NewsArticle:
     full_content  : Full body text of the article (may be None if not scraped yet).
     image_url     : Thumbnail URL taken from the RSS entry (None if the feed has no image).
     publisher_url : Publisher homepage (Google News results only) — used to show the publisher logo.
-    summary       : AI-generated summary stored as a list of bullet-point strings.
+    saved_by_user : True when a user saved it from the search page — never removed by the old-article purge.
+    summary      : AI-generated summary stored as a list of bullet-point strings.
     published_at  : Publication timestamp from the RSS feed.
     id            : Firestore document id (defaults to article_id(source_url)).
     created_at    : Record creation timestamp (auto-set).
@@ -51,6 +52,7 @@ class NewsArticle:
     full_content:  str | None = None
     image_url:     str | None = None
     publisher_url: str | None = None
+    saved_by_user: bool       = False
     summary:       list[str]  = field(default_factory=list)
     published_at:  datetime | None = None
     id:            str        = ""
@@ -76,7 +78,8 @@ class NewsArticle:
             "full_content":  self.full_content,
             "image_url":     self.image_url,
             "publisher_url": self.publisher_url,
-            "summary":       self.summary or None,   # store null when empty
+            "saved_by_user": self.saved_by_user,
+            "summary":      self.summary or None,   # store null when empty
             "source":        self.source,
             "source_url":    self.source_url,
             "category":      self.category,
@@ -99,7 +102,8 @@ class NewsArticle:
             full_content  = data.get("full_content"),
             image_url     = data.get("image_url"),
             publisher_url = data.get("publisher_url"),
-            summary       = data.get("summary") or [],
+            saved_by_user = bool(data.get("saved_by_user")),
+            summary      = data.get("summary") or [],
             published_at  = _parse_dt(data.get("published_at")),
             created_at    = _parse_dt(data.get("created_at")) or _now_utc(),
         )

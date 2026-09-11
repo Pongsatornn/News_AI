@@ -51,17 +51,35 @@ def delete_article(doc_id: str) -> bool:
     try:
         _articles().document(doc_id).delete()
         return True
-    except Exception as e:
-        print(f"Delete error: {e}")
+    except Exception:
+        logger.exception("ลบข่าวไม่สำเร็จ: %s", doc_id)
         return False
 
 def update_summary(doc_id: str, summary: list[str]) -> bool:
     try:
         _articles().document(doc_id).update({"summary": summary})
         return True
-    except Exception as e:
-        print(f"Update error: {e}")
+    except Exception:
+        logger.exception("บันทึกสรุปไม่สำเร็จ: %s", doc_id)
         return False
+
+def delete_old_articles(before: str, limit: int = 500) -> int:
+    """ลบข่าวที่บันทึกก่อน before (ISO แบบ UTC เทียบกับ created_at) ไม่เกิน limit ข่าว — คืนจำนวนที่ลบ
+    ข้ามข่าวที่ผู้ใช้กดบันทึกเอง (saved_by_user) และข่าวจาก Google News (มี publisher_url — ได้มาจากการกดบันทึกเท่านั้น)
+    อ่านเฉพาะสองฟิลด์นี้ ไม่ดาวน์โหลดเนื้อข่าว / batch ของ Firestore ลบได้ครั้งละไม่เกิน 500"""
+    query = _articles().where(filter=FieldFilter("created_at", "<", before)).select(["saved_by_user", "publisher_url"])
+    batch, deleted = get_db().batch(), 0
+    for doc in query.stream():
+        if deleted >= limit:
+            break
+        data = doc.to_dict()
+        if data.get("saved_by_user") or data.get("publisher_url"):
+            continue
+        batch.delete(doc.reference)
+        deleted += 1
+    if deleted:
+        batch.commit()
+    return deleted
 
 def list_articles(category: str | None = None, limit: int = 100) -> list[dict]:
     """ข่าวล่าสุดเรียงตาม published_at ไม่เกิน limit ข่าว"""

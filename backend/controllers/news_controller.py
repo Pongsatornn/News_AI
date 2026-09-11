@@ -4,7 +4,7 @@ import os
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -19,12 +19,12 @@ from groq import RateLimitError
 
 from models.news_article import NewsArticle
 from services import briefing_service
-from services.firebase_service import insert_article, is_duplicate, update_summary
+from services.firebase_service import delete_old_articles, insert_article, is_duplicate, update_summary
 from services.groq_service import GroqService, InsufficientContentError
+from services.logging_setup import setup_logging
 from services.rss_utils import (SHORT_CONTENT, clean_html, extract_article_text, extract_image,
                                 extract_og_image, fetch_feed, fetch_page)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
 
 RSS_FEEDS = [
@@ -55,6 +55,10 @@ AUTO_SUMMARY_PER_RUN = int(os.environ.get("AUTO_SUMMARY_PER_RUN", "5"))  # 0 = �
 AUTO_SUMMARY_INPUT = 3000   # ตัวอักษร (~1,000 token)
 AUTO_SUMMARY_DELAY = 20     # วินาทีระหว่างแต่ละข่าว — เหลือโควตาต่อนาทีให้ผู้ใช้กดสรุปได้ระหว่างนั้น
 BRIEFING_INTERVAL_HOURS = float(os.environ.get("BRIEFING_INTERVAL_HOURS", "3"))  # 0 = ไม่สร้างเอง
+
+# ลบข่าวเก่า — หน้าหลักแสดงแค่ 100 ข่าวล่าสุดและสรุปข่าวเด่นใช้แค่ 24 ชั่วโมง ไม่ต้องเก็บทุกข่าวไว้ตลอดไป
+RETENTION_DAYS = float(os.environ.get("RETENTION_DAYS", "30"))  # 0 = เก็บไว้ตลอด
+MAX_DELETE_PER_RUN = 500  # batch ของ Firestore ลบได้ครั้งละไม่เกิน 500 — ที่เหลือลบรอบถัดไป
 
 # URL ที่รู้แล้วว่ามีใน Firestore — รอบถัดไปไม่ต้องอ่าน Firestore ซ้ำ (ประหยัดโควตาตอนดึงอัตโนมัติ)
 _known_urls: set[str] = set()
@@ -247,6 +251,17 @@ def _refresh_briefing() -> None:
         pass
 
 
+def purge_old_articles() -> int:
+    """ลบข่าวที่บันทึกไว้เกิน RETENTION_DAYS วัน — ข่าวที่ผู้ใช้กดบันทึกเองจะไม่ถูกลบ"""
+    if RETENTION_DAYS <= 0:
+        return 0
+    before = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
+    deleted = delete_old_articles(before.isoformat(), MAX_DELETE_PER_RUN)
+    if deleted:
+        logger.info("ลบข่าวที่เก่ากว่า %g วันแล้ว %d ข่าว", RETENTION_DAYS, deleted)
+    return deleted
+
+
 def start_auto_fetch(interval_minutes: float) -> threading.Thread:
     """ดึงข่าวทันที แล้วดึงซ้ำทุก interval_minutes นาทีใน background thread (daemon — ปิดไปพร้อม server)"""
     def loop():
@@ -255,6 +270,10 @@ def start_auto_fetch(interval_minutes: float) -> threading.Thread:
                 NewsController().run()
             except Exception:
                 logger.exception("ดึงข่าวอัตโนมัติไม่สำเร็จ — จะลองใหม่รอบหน้า")
+            try:
+                purge_old_articles()
+            except Exception:
+                logger.exception("ลบข่าวเก่าไม่สำเร็จ — จะลองใหม่รอบหน้า")
             try:
                 _refresh_briefing()
             except Exception:
@@ -268,4 +287,5 @@ def start_auto_fetch(interval_minutes: float) -> threading.Thread:
 
 
 if __name__ == "__main__":
+    setup_logging()
     NewsController().run()

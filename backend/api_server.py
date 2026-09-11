@@ -26,6 +26,7 @@ from models.news_article import NewsArticle
 from services.search_service import match_feeds, search_news, warm_cache
 from services.firebase_service import insert_article, is_duplicate, delete_article, list_articles, update_summary
 from services.groq_service import GroqService, InsufficientContentError
+from services.logging_setup import setup_logging
 from services.rss_utils import SHORT_CONTENT, clean_html, fetch_article_text
 
 logger = logging.getLogger(__name__)
@@ -142,7 +143,8 @@ def _article_from_request(data: dict) -> NewsArticle:
         full_content  = clean_html(_text(data.get("full_content"), 50_000)) or None,
         image_url     = _http_url(data.get("image_url")),
         publisher_url = _http_url(data.get("publisher_url")),
-        summary       = [_text(s, 500) for s in summary[:5] if isinstance(s, str)],
+        saved_by_user = True,  # ผู้ใช้เลือกเก็บเอง — ตัวลบข่าวเก่าจะข้ามข่าวนี้
+        summary      = [_text(s, 500) for s in summary[:5] if isinstance(s, str)],
         published_at  = published_at,
     )
 
@@ -308,8 +310,9 @@ def delete(doc_id):
 
 
 if __name__ == "__main__":
+    logger.info("เขียน log ลงไฟล์ %s", setup_logging())
     if not API_TOKEN:
-        print("⚠️  ยังไม่ได้ตั้ง API_TOKEN ใน backend/.env — endpoint บันทึก/ลบ/สรุปจะไม่เช็ก token")
+        logger.warning("ยังไม่ได้ตั้ง API_TOKEN ใน backend/.env — endpoint บันทึก/ลบ/สรุปจะไม่เช็ก token")
     # debug=True เปิด Werkzeug debugger ที่สั่งรันโค้ดบนเครื่องได้ — เปิดเฉพาะตอนพัฒนาด้วย FLASK_DEBUG=1
     # และห้ามใช้คู่กับ API_HOST=0.0.0.0 (คนในวงแลนเดียวกันจะเข้าถึง debugger ได้)
     debug = os.environ.get("FLASK_DEBUG") == "1"

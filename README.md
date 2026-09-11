@@ -10,6 +10,7 @@
 - **ฟังสรุป:** อ่านออกเสียงสรุปข่าวและสรุปข่าวเด่นด้วยเสียงภาษาไทยของเบราว์เซอร์ (Microsoft Edge มีเสียงไทยในตัว ส่วน Chrome ต้องมีเสียงไทยติดตั้งใน Windows)
 - **ติดตามหัวข้อ 🔔:** เพิ่มคำที่สนใจ (สูงสุด 10 หัวข้อ เก็บในเบราว์เซอร์) ระบบหาข่าวใหม่จากทุกสำนักทุก 5 นาที และขึ้นจำนวนข่าวใหม่บนแท็บ
 - **ถาม AI เกี่ยวกับข่าว 💬:** ถามคำถามในหน้าต่างข่าวได้ AI ตอบจากเนื้อหาข่าวนั้นเท่านั้น และถามต่อเนื่องได้
+- **ลบข่าวเก่าเอง:** ตัวดึงข่าวลบข่าวที่บันทึกไว้เกิน 30 วัน (ตั้งได้ใน `RETENTION_DAYS`) ยกเว้นข่าวที่กดบันทึกจากหน้าค้นหา
 
 ## โครงสร้าง
 
@@ -21,10 +22,13 @@ news-aggregator/
 │   │   └── news_controller.py    รายการ RSS และตัวดึงข่าวลง Firestore
 │   ├── models/news_article.py    โครงสร้างข้อมูลข่าว
 │   ├── services/
-│   │   ├── firebase_service.py   อ่าน/เขียน Firestore
+│   │   ├── briefing_service.py   สรุปข่าวเด่นวันนี้
+│   │   ├── firebase_service.py   อ่าน/เขียน Firestore และลบข่าวเก่า
 │   │   ├── groq_service.py       สรุปข่าวด้วย Groq
+│   │   ├── logging_setup.py      log ออกหน้าจอและลงไฟล์
 │   │   ├── rss_utils.py          โหลด RSS, หารูป, ตัด HTML
 │   │   └── search_service.py     ค้นหาข่าว
+│   ├── logs/                     newsai.log (สร้างเองตอนรัน ไม่อยู่ใน git)
 │   ├── tests/                    unit test (ไม่แตะ Firestore/Groq จริง)
 │   └── requirements.txt
 ├── frontend/                     React + Vite + Tailwind CSS v4
@@ -92,6 +96,7 @@ npm run dev
 
 - เปิด `api_server.py` แล้วจะดึงข่าวทันที และดึงซ้ำทุก `FETCH_INTERVAL_MINUTES` นาที
 - ถ้าจะดึงข่าวแค่รอบเดียวโดยไม่เปิด API: `python controllers/news_controller.py` (รันในโฟลเดอร์ `backend`)
+- log ของ backend เขียนลง `backend/logs/newsai.log` ด้วย ปิด terminal แล้วยังเปิดดูย้อนหลังได้ (ไฟล์ละ 1 MB เก็บไฟล์เก่าไว้ 5 ไฟล์ และไม่เก็บบรรทัดของแต่ละ request)
 
 ## ตั้งค่า (`.env`)
 
@@ -102,6 +107,7 @@ npm run dev
 | `FETCH_INTERVAL_MINUTES` | backend | `30` | ดึงข่าวอัตโนมัติทุกกี่นาที (`0` = ปิด) |
 | `AUTO_SUMMARY_PER_RUN` | backend | `5` | จำนวนข่าวใหม่ที่ให้ AI สรุปรอไว้ต่อรอบ (`0` = ปิด) |
 | `BRIEFING_INTERVAL_HOURS` | backend | `3` | สร้างสรุปข่าวเด่นใหม่ทุกกี่ชั่วโมง (`0` = ไม่สร้างเอง) |
+| `RETENTION_DAYS` | backend | `30` | ลบข่าวที่บันทึกไว้เกินกี่วัน รอบละไม่เกิน 500 ข่าว ข่าวที่กดบันทึกจากหน้าค้นหาไม่ถูกลบ (`0` = เก็บไว้ตลอด) |
 | `API_HOST` | backend | `127.0.0.1` | IP ที่ backend เปิดรับ |
 | `CORS_ORIGINS` | backend | `http://localhost:5173,http://127.0.0.1:5173` | เว็บที่อนุญาตให้เรียก API |
 | `FLASK_DEBUG` | backend | ปิด | `1` = เปิด debugger (ห้ามใช้คู่กับ `API_HOST=0.0.0.0`) |
@@ -119,7 +125,7 @@ npm run dev
 | GET | `/api/topics?q=หัวข้อ&q=...` | ข่าวล่าสุดของหัวข้อที่ติดตาม (สูงสุด 10 หัวข้อ ค้นจาก feed ของเราใน cache ไม่อ่าน Firestore และไม่เรียก Google) | |
 | POST | `/api/ask` | ถามคำถามเกี่ยวกับข่าว — body `{title, content, source_url?, question, history?}` | ✓ |
 | POST | `/api/summarize` | สรุปข่าวด้วย AI — body `{title, content, source_url?, id?}` ถ้าเนื้อหาสั้นและเป็นข่าวจากสำนักใน RSS จะเปิดหน้าข่าวดึงเนื้อหาเต็มมาสรุป ถ้าส่ง `id` จะบันทึกสรุปลง Firestore | ✓ |
-| POST | `/api/save` | บันทึกข่าวจากหน้าค้นหาลง Firestore | ✓ |
+| POST | `/api/save` | บันทึกข่าวจากหน้าค้นหาลง Firestore (ข่าวนี้จะไม่ถูกลบตอนลบข่าวเก่า) | ✓ |
 | DELETE | `/api/delete/<id>` | ลบข่าว | ✓ |
 
 token ส่งทาง header `X-API-Token`

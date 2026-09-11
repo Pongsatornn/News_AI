@@ -8,3 +8,6 @@ _removed/
 # python
 .venv*/
 __pycache__/
+
+# log ของ backend (backend/logs/newsai.log)
+logs/

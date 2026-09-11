@@ -230,6 +230,7 @@ class ApiTest(unittest.TestCase):
         self.assertEqual((saved["title"], saved["category"], saved["full_content"]), ("หัวข่าว", "general", "เนื้อหา"))
         self.assertEqual((saved["image_url"], saved["summary"]), (None, ["ข้อ 1"]))
         self.assertNotIn("extra", saved)
+        self.assertTrue(saved["saved_by_user"])  # ตัวลบข่าวเก่าจะข้ามข่าวที่ผู้ใช้บันทึกเอง
 
     def test_save_stores_published_at_in_utc(self):
         cases = [("2026-09-11T10:00:00", "2026-09-11T03:00:00+00:00"),  # ไม่มี timezone — ถือเป็นเวลาไทย

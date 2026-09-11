@@ -2,6 +2,7 @@ import collections
 import json
 import logging
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 import httpx
@@ -90,6 +91,10 @@ class FetcherTest(unittest.TestCase):
     def test_saved_content_has_no_html(self):
         nc.NewsController().run()
         self.assertTrue(all(d["full_content"] == "เนื้อหา ข่าว" for d in self.inserted))
+
+    def test_fetched_articles_are_not_marked_as_saved_by_user(self):
+        nc.NewsController().run()
+        self.assertFalse(any(d["saved_by_user"] for d in self.inserted))  # ตัวลบข่าวเก่าจึงลบได้
 
     def test_known_urls_are_not_read_from_firestore_again(self):
         self.feeds = make_feeds(5)  # น้อยกว่าโควตา — รอบแรกบันทึกหมด
@@ -189,6 +194,23 @@ class FetcherTest(unittest.TestCase):
         self.assertFalse(nc.LAST_RUN["running"])
         self.assertEqual(nc.LAST_RUN["new_count"], total)
         self.assertIsNotNone(nc.LAST_RUN["finished_at"])
+
+
+class PurgeTest(unittest.TestCase):
+    def test_deletes_articles_older_than_retention_days(self):
+        with mock.patch.object(nc, "RETENTION_DAYS", 30), \
+             mock.patch.object(nc, "delete_old_articles", return_value=4) as delete:
+            self.assertEqual(nc.purge_old_articles(), 4)
+        before, limit = delete.call_args.args
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(before)
+        self.assertAlmostEqual(age.total_seconds(), 30 * 86400, delta=60)
+        self.assertEqual(limit, nc.MAX_DELETE_PER_RUN)
+
+    def test_zero_retention_keeps_everything(self):
+        with mock.patch.object(nc, "RETENTION_DAYS", 0), \
+             mock.patch.object(nc, "delete_old_articles") as delete:
+            self.assertEqual(nc.purge_old_articles(), 0)
+        delete.assert_not_called()
 
 
 if __name__ == "__main__":
