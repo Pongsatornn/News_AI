@@ -1,0 +1,10 @@
+# secrets
+.env
+serviceAccountKey.json
+
+# ไฟล์เก่าที่ย้ายออกมาแทนการลบ
+_removed/
+
+# python
+.venv*/
+__pycache__/

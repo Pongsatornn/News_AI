@@ -1,0 +1,22 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  width: 100%;
+  background: #f8f9fa;
+  font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans Thai", "Leelawadee UI", Tahoma, sans-serif;
+}
+#root { width: 100%; }
+button, input { font: inherit; }
+
+.header-inner { padding: 16px 24px 0; }
+.page { padding: 24px; }
+/* min(280px, 100%) — จอแคบกว่า 280px การ์ดจะหดตามจอแทนที่จะล้นออกด้านข้าง */
+.news-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr));
+  gap: 16px;
+}
+
+@media (max-width: 480px) {
+  .header-inner { padding: 12px 16px 0; }
+  .page { padding: 16px; }
+}
