@@ -1,36 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { apiGet } from "../lib/api";
 
-// ใช้ 127.0.0.1 ตรง ๆ — backend เปิดเฉพาะ IPv4 loopback ส่วน "localhost" บางเครื่องจะวิ่งไป ::1 ก่อน
-export const API_BASE = "http://127.0.0.1:5000/api";
-const API_TOKEN = import.meta.env.VITE_API_TOKEN;
-
-// เรียก backend แล้วคืน JSON — error ทุกแบบกลายเป็นข้อความภาษาไทยที่แสดงให้ผู้ใช้ได้เลย
-async function request(path, options) {
-  let res;
-  try {
-    res = await fetch(`${API_BASE}${path}`, options);
-  } catch {
-    throw new Error("เชื่อมต่อ backend ไม่ได้ — รัน python api_server.py หรือยัง?");
-  }
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `เซิร์ฟเวอร์ตอบกลับผิดพลาด (HTTP ${res.status})`);
-  return data;
-}
-
-export function apiGet(path) {
-  return request(path);
-}
-
-// endpoint ที่แก้ข้อมูล (สรุป/บันทึก) ต้องแนบ token ให้ตรงกับ API_TOKEN ใน backend/.env
-export function apiPost(path, body) {
-  return request(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...(API_TOKEN && { "X-API-Token": API_TOKEN }) },
-    body: JSON.stringify(body),
-  });
-}
-
-export function useNews(category = null) {
+// ข่าวในหน้าหลัก — เปลี่ยนหมวดหรือกดโหลดเพิ่มแล้วดึงใหม่
+export function useNews(category = null, limit = 100) {
   const [articles, setArticles] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -46,8 +18,9 @@ export function useNews(category = null) {
       setLoading(true);
       setError(null);
       try {
-        const qs = category ? `?category=${encodeURIComponent(category)}` : "";
-        const data = await apiGet(`/news${qs}`);
+        const params = new URLSearchParams({ limit });
+        if (category) params.set("category", category);
+        const data = await apiGet(`/news?${params}`);
         if (!cancelled) setArticles(data.results);
       } catch (err) {
         if (!cancelled) setError(err.message);
@@ -57,7 +30,7 @@ export function useNews(category = null) {
     }
     fetchArticles();
     return () => { cancelled = true; };
-  }, [category, reloadKey]);
+  }, [category, limit, reloadKey]);
 
   const reload = useCallback(() => setReloadKey(k => k + 1), []);
 

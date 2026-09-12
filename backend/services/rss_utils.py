@@ -10,6 +10,7 @@ import re
 import urllib.request
 
 import feedparser
+from urllib.parse import urlparse
 
 SHORT_CONTENT = 400  # ตัวอักษร — เนื้อหาใน RSS ที่สั้นกว่านี้เป็นแค่เกริ่นนำ (เช่นไทยรัฐ) ต้องไปดึงเนื้อหาเต็มจากหน้าข่าว
 
@@ -31,6 +32,26 @@ _LD_JSON = re.compile(r"<script[^>]+application/ld\+json[^>]*>(.*?)</script>", r
 _NEXT_PUSH = re.compile(r'self\.__next_f\.push\(\[1,("(?:[^"\\]|\\.)*")\]\)', re.S)
 _FLIGHT_TEXT_ROW = re.compile(rb"(?:^|\n)[0-9a-z]+:T([0-9a-f]+),")
 _FLIGHT_CONTENT = re.compile(r'"content":\s*("(?:[^"\\]|\\.)*")')
+
+
+class _SameHostRedirect(urllib.request.HTTPRedirectHandler):
+    """ยอมตาม redirect เฉพาะไป host ที่อนุญาต — กันเว็บข่าวเด้งต่อไปยังเครื่องในวงแลนหรือ 127.0.0.1
+    (คืน None = ไม่ตาม redirect นั้น urllib จะโยน HTTPError ออกมาแทน)"""
+
+    def __init__(self, allowed_hosts):
+        self.allowed_hosts = allowed_hosts
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urlparse(newurl)
+        if target.scheme not in ("http", "https") or target.hostname not in self.allowed_hosts:
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open(req, timeout: float, allowed_hosts):
+    if allowed_hosts is None:
+        return urllib.request.urlopen(req, timeout=timeout)
+    return urllib.request.build_opener(_SameHostRedirect(allowed_hosts)).open(req, timeout=timeout)
 
 
 def clean_html(text: str | None) -> str:
@@ -69,11 +90,13 @@ def extract_image(entry) -> str | None:
     return m.group(1) if m else None
 
 
-def fetch_page(page_url: str, timeout: float = 10, max_bytes: int = 2_000_000) -> str | None:
-    """โหลด HTML ของหน้าข่าว — คืน None ถ้าโหลดไม่ได้"""
+def fetch_page(page_url: str, timeout: float = 10, max_bytes: int = 2_000_000,
+               allowed_hosts: set[str] | None = None) -> str | None:
+    """โหลด HTML ของหน้าข่าว — คืน None ถ้าโหลดไม่ได้
+    allowed_hosts: ใส่เมื่อ URL มาจาก client — จะไม่ตาม redirect ออกนอก host เหล่านี้"""
     try:
         req = urllib.request.Request(page_url, headers=_BROWSER_HEADERS)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _open(req, timeout, allowed_hosts) as resp:
             return resp.read(max_bytes).decode("utf-8", "ignore")
     except Exception:
         return None
@@ -92,8 +115,8 @@ def extract_article_text(page_html: str) -> str:
     return max((clean_html(t) for t in (_ld_json_article_body(page_html), _next_flight_text(page_html))), key=len)
 
 
-def fetch_article_text(page_url: str, timeout: float = 10) -> str:
-    page = fetch_page(page_url, timeout)
+def fetch_article_text(page_url: str, timeout: float = 10, allowed_hosts: set[str] | None = None) -> str:
+    page = fetch_page(page_url, timeout, allowed_hosts=allowed_hosts)
     return extract_article_text(page) if page else ""
 
 

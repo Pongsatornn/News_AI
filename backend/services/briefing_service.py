@@ -90,13 +90,14 @@ def build_briefing(groq: GroqService | None = None, now: datetime | None = None)
     }
 
 
-def generate(groq: GroqService | None = None) -> dict | None:
-    """สร้างสรุปใหม่แล้วบันทึกลง Firestore — ถ้ามีการสร้างอยู่แล้วจะ raise BriefingBusyError"""
+def generate(groq: GroqService | None = None, now: datetime | None = None) -> dict | None:
+    """สร้างสรุปใหม่แล้วบันทึกลง Firestore — ถ้ามีการสร้างอยู่แล้วจะ raise BriefingBusyError
+    now ใส่ได้ตอนเขียน test เพื่อไม่ให้ผลขึ้นกับเวลาจริง"""
     global _cache, _loaded
     if not _lock.acquire(blocking=False):
         raise BriefingBusyError
     try:
-        briefing = build_briefing(groq)
+        briefing = build_briefing(groq, now)
         if briefing:
             save_briefing(briefing)
             _cache, _loaded = briefing, True

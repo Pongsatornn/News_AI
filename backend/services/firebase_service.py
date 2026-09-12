@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 
 _db = None
 
+# ไม่มี composite index → ดึงมาเรียงในเครื่องได้ไม่เกิน limit เท่านี้เท่า (ข่าวที่เก่ากว่านั้นยอมตกหล่นดีกว่าเผาโควตา)
+FALLBACK_FACTOR = 5
+
 def get_db():
     global _db
     if _db is None:
@@ -81,6 +84,14 @@ def delete_old_articles(before: str, limit: int = 500) -> int:
         batch.commit()
     return deleted
 
+def article_exists(doc_id: str) -> bool:
+    return _articles().document(doc_id).get().exists
+
+def article_source_url(doc_id: str) -> str | None:
+    """ลิงก์ข่าวของ document นี้ — ใช้ยืนยันว่า id ที่ client ส่งมาเป็นของข่าวเดียวกันจริง"""
+    doc = _articles().document(doc_id).get()
+    return (doc.to_dict() or {}).get("source_url") if doc.exists else None
+
 def list_articles(category: str | None = None, limit: int = 100) -> list[dict]:
     """ข่าวล่าสุดเรียงตาม published_at ไม่เกิน limit ข่าว"""
     query = _articles()
@@ -92,7 +103,8 @@ def list_articles(category: str | None = None, limit: int = 100) -> list[dict]:
         # กรอง category + เรียง published_at ต้องมี composite index — ถ้ายังไม่มีให้ดึงทั้งหมวดมาเรียงเอง
         # ใน error จะมีลิงก์สำหรับสร้าง index บน Firebase console
         logger.warning("ยังไม่มี Firestore index สำหรับกรองหมวด: %s", e)
-        docs = query.get()
+        # ไม่มี index ก็เรียงเองไม่ได้ ต้องดึงมาเรียงในเครื่อง — จำกัดจำนวนไว้ ไม่งั้นหมวดใหญ่ ๆ จะกินโควตาอ่านทีละพัน
+        docs = query.limit(limit * FALLBACK_FACTOR).get()
 
     articles = [{**d.to_dict(), "id": d.id} for d in docs]
     articles.sort(key=lambda a: a.get("published_at") or "", reverse=True)

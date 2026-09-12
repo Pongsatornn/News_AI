@@ -10,6 +10,7 @@
 - **ฟังสรุป:** อ่านออกเสียงสรุปข่าวและสรุปข่าวเด่นด้วยเสียงภาษาไทยของเบราว์เซอร์ (Microsoft Edge มีเสียงไทยในตัว ส่วน Chrome ต้องมีเสียงไทยติดตั้งใน Windows)
 - **ติดตามหัวข้อ 🔔:** เพิ่มคำที่สนใจ (สูงสุด 10 หัวข้อ เก็บในเบราว์เซอร์) ระบบหาข่าวใหม่จากทุกสำนักทุก 5 นาที และขึ้นจำนวนข่าวใหม่บนแท็บ
 - **ถาม AI เกี่ยวกับข่าว 💬:** ถามคำถามในหน้าต่างข่าวได้ AI ตอบจากเนื้อหาข่าวนั้นเท่านั้น และถามต่อเนื่องได้
+- **ลบข่าวที่ไม่อยากเก็บ:** เปิดหน้าต่างข่าวในหน้าหลักแล้วกด "ลบข่าวนี้ออกจากหน้าหลัก" ได้
 - **ลบข่าวเก่าเอง:** ตัวดึงข่าวลบข่าวที่บันทึกไว้เกิน 30 วัน (ตั้งได้ใน `RETENTION_DAYS`) ยกเว้นข่าวที่กดบันทึกจากหน้าค้นหา
 
 ## โครงสร้าง
@@ -33,9 +34,12 @@ news-aggregator/
 │   └── requirements.txt
 ├── frontend/                     React + Vite + Tailwind CSS v4
 │   └── src/
-│       ├── App.jsx               หน้าเว็บทั้งหมด (style เป็น class ของ Tailwind)
+│       ├── App.jsx               โครงหน้าเว็บ (header, แท็บ, หน้าหลัก)
 │       ├── index.css             ตั้งค่า Tailwind + สีของเว็บ (@theme)
-│       └── hooks/useNews.js      เรียก API
+│       ├── components/           NewsCard, ArticleModal, AskSection, LiveResults และหน้าค้นหา/ติดตาม/สรุปวันนี้
+│       ├── hooks/                useNews, useSpeech, useSummariser, useTopics
+│       └── lib/                  api.js (เรียก backend), format.js (แปลงข้อมูล), ui.js (หมวด/แท็บ/class ที่ใช้ซ้ำ)
+├── .github/workflows/ci.yml      รัน unittest + lint + build ทุกครั้งที่ push
 └── log.md                        บันทึกการแก้ไขแต่ละรอบ
 ```
 
@@ -103,7 +107,9 @@ npm run dev
 | ตัวแปร | ไฟล์ | ค่าเริ่มต้น | ใช้ทำอะไร |
 |---|---|---|---|
 | `GROQ_API_KEY` | backend | — | key สำหรับสรุปข่าวด้วย AI (จำเป็น) |
-| `API_TOKEN` | backend | — | token ของ endpoint สรุป/บันทึก/ลบ (ถ้าไม่ตั้งจะไม่เช็ก) |
+| `GROQ_MODEL` | backend | `qwen/qwen3.8-27b` | โมเดลที่ใช้สรุป/ตอบคำถาม (Groq ถอดโมเดลออกเป็นระยะ) |
+| `API_TOKEN` | backend | — | token ของ endpoint สรุป/บันทึก/ลบ (ถ้าไม่ตั้งจะไม่เช็ก และเปิด `API_HOST` ออกนอก 127.0.0.1 ไม่ได้) |
+| `AI_RATE_LIMIT_PER_MIN` | backend | `20` | จำนวนครั้งต่อ IP ต่อนาทีของ endpoint ที่ใช้โควตา AI (`0` = ไม่จำกัด) |
 | `FETCH_INTERVAL_MINUTES` | backend | `30` | ดึงข่าวอัตโนมัติทุกกี่นาที (`0` = ปิด) |
 | `AUTO_SUMMARY_PER_RUN` | backend | `5` | จำนวนข่าวใหม่ที่ให้ AI สรุปรอไว้ต่อรอบ (`0` = ปิด) |
 | `BRIEFING_INTERVAL_HOURS` | backend | `3` | สร้างสรุปข่าวเด่นใหม่ทุกกี่ชั่วโมง (`0` = ไม่สร้างเอง) |
@@ -112,12 +118,13 @@ npm run dev
 | `CORS_ORIGINS` | backend | `http://localhost:5173,http://127.0.0.1:5173` | เว็บที่อนุญาตให้เรียก API |
 | `FLASK_DEBUG` | backend | ปิด | `1` = เปิด debugger (ห้ามใช้คู่กับ `API_HOST=0.0.0.0`) |
 | `VITE_API_TOKEN` | frontend | — | ต้องตรงกับ `API_TOKEN` |
+| `VITE_API_BASE` | frontend | `http://127.0.0.1:5000/api` | ที่อยู่ของ backend (ใส่เมื่อไม่ได้รันในเครื่องเดียวกัน) |
 
 ## API
 
 | Method | Path | ใช้ทำอะไร | ต้องใช้ token |
 |---|---|---|---|
-| GET | `/api/news?category=sports` | ข่าวล่าสุด 100 ข่าวจาก Firestore (ไม่ใส่ category = ทุกหมวด) | |
+| GET | `/api/news?category=sports&limit=100` | ข่าวล่าสุดจาก Firestore (ไม่ใส่ category = ทุกหมวด, `limit` สูงสุด 300) | |
 | GET | `/api/search?q=คำค้น` | ค้นข่าวจาก RSS + Google News ได้สูงสุด 60 ข่าว เรียงจากใหม่ไปเก่า | |
 | GET | `/api/status` | สถานะการดึงข่าวอัตโนมัติรอบล่าสุด | |
 | GET | `/api/briefing` | สรุปข่าวเด่นฉบับล่าสุด | |
@@ -126,11 +133,15 @@ npm run dev
 | POST | `/api/ask` | ถามคำถามเกี่ยวกับข่าว — body `{title, content, source_url?, question, history?}` | ✓ |
 | POST | `/api/summarize` | สรุปข่าวด้วย AI — body `{title, content, source_url?, id?}` ถ้าเนื้อหาสั้นและเป็นข่าวจากสำนักใน RSS จะเปิดหน้าข่าวดึงเนื้อหาเต็มมาสรุป ถ้าส่ง `id` จะบันทึกสรุปลง Firestore | ✓ |
 | POST | `/api/save` | บันทึกข่าวจากหน้าค้นหาลง Firestore (ข่าวนี้จะไม่ถูกลบตอนลบข่าวเก่า) | ✓ |
-| DELETE | `/api/delete/<id>` | ลบข่าว | ✓ |
+| DELETE | `/api/delete/<id>` | ลบข่าว (ไม่มีข่าวนี้ = 404) | ✓ |
 
 token ส่งทาง header `X-API-Token`
 
+endpoint ที่ใช้โควตา AI (`/api/summarize`, `/api/ask`, `POST /api/briefing`) จำกัดไว้ที่ `AI_RATE_LIMIT_PER_MIN` ครั้งต่อ IP ต่อนาที เกินแล้วได้ 429
+
 ## ทดสอบ
+
+ทั้งหมดนี้รันอัตโนมัติทุกครั้งที่ push ด้วย GitHub Actions (`.github/workflows/ci.yml`)
 
 ```bash
 # backend — ใช้ RSS/Firestore/Groq จำลองทั้งหมด ไม่เรียกเครือข่ายและไม่เขียนฐานข้อมูลจริง
@@ -145,6 +156,6 @@ npm run build
 
 ## หมายเหตุ
 
-- **ออกแบบให้ใช้ในเครื่องตัวเอง:** token ฝั่ง frontend อยู่ในโค้ดเว็บที่ build ออกมา ถ้าจะเปิดให้คนอื่นใช้ผ่านอินเทอร์เน็ตต้องมีระบบ login จริง และเปลี่ยนไปใช้ production server แทน Flask dev server
+- **ออกแบบให้ใช้ในเครื่องตัวเอง:** token ฝั่ง frontend อยู่ในโค้ดเว็บที่ build ออกมา ถ้าจะเปิดให้คนอื่นใช้ผ่านอินเทอร์เน็ตต้องมีระบบ login จริง และเปลี่ยนไปใช้ production server แทน Flask dev server (ตัวดึงข่าวอัตโนมัติอยู่ในโปรเซสเดียวกับ API ถ้ารันหลาย worker ต้องแยกออกไปเป็นงานเบื้องหลังต่างหาก ไม่งั้นทุก worker จะดึงข่าวซ้ำกัน)
 - **โควตา:** Firestore แบบฟรีอ่านได้ 50,000 ครั้งต่อวัน ตัวดึงข่าวจำ URL ที่รู้แล้วไว้ จึงอ่านเยอะเฉพาะรอบแรกหลังเปิด server (ไม่เกินราว 1,300 ครั้ง) ส่วน Groq (โมเดล `qwen/qwen3.8-27b` แบบฟรี) จำกัด 1,000 ครั้งต่อวัน และ 8,000 token ต่อนาที (ข่าวไทย 1 ข่าวใช้ราว 600–1,500 token) การสรุปรอไว้กับสรุปข่าวเด่นใช้รวมราว 250 ครั้งต่อวันตามค่าเริ่มต้น ที่เหลือไว้ให้ผู้ใช้กดสรุปเอง ถ้าโควตาเต็มจะขึ้นข้อความให้รอสักครู่
 - ประวัติการแก้ไขแต่ละรอบอยู่ใน [log.md](log.md)

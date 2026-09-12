@@ -1,7 +1,30 @@
 import json
 import unittest
 
-from services.rss_utils import clean_html, extract_article_text, extract_image, extract_og_image
+import urllib.request
+
+from services.rss_utils import (_SameHostRedirect, clean_html, extract_article_text, extract_image,
+                                extract_og_image)
+
+
+class RedirectGuardTest(unittest.TestCase):
+    """หน้าข่าวที่ผู้ใช้สั่งให้ backend เปิด ต้องไม่ถูก redirect พาไปเครื่องอื่น (SSRF)"""
+
+    def setUp(self):
+        self.handler = _SameHostRedirect({"www.thairath.co.th"})
+        self.request = urllib.request.Request("https://www.thairath.co.th/news/1")
+
+    def follow(self, newurl):
+        return self.handler.redirect_request(self.request, None, 302, "Found", {}, newurl)
+
+    def test_same_host_is_followed(self):
+        self.assertIsNotNone(self.follow("https://www.thairath.co.th/news/2"))
+
+    def test_other_hosts_are_blocked(self):
+        for url in ("http://127.0.0.1:8080/admin", "http://192.168.1.1/", "https://evil.test/x",
+                    "file:///etc/passwd"):
+            with self.subTest(url=url):
+                self.assertIsNone(self.follow(url))
 
 
 class CleanHtmlTest(unittest.TestCase):

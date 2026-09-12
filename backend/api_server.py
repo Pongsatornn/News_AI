@@ -9,6 +9,8 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+import threading
+import time
 from datetime import datetime, timezone
 from functools import wraps
 from urllib.parse import urlparse
@@ -22,9 +24,10 @@ load_dotenv()
 
 from controllers.news_controller import LAST_RUN, RSS_FEEDS, start_auto_fetch
 from services import briefing_service
-from models.news_article import NewsArticle
+from models.news_article import NewsArticle, article_id
 from services.search_service import match_feeds, search_news, warm_cache
-from services.firebase_service import insert_article, is_duplicate, delete_article, list_articles, update_summary
+from services.firebase_service import (article_exists, article_source_url, insert_article, is_duplicate,
+                                       delete_article, list_articles, update_summary)
 from services.groq_service import GroqService, InsufficientContentError
 from services.logging_setup import setup_logging
 from services.rss_utils import SHORT_CONTENT, clean_html, fetch_article_text
@@ -32,6 +35,8 @@ from services.rss_utils import SHORT_CONTENT, clean_html, fetch_article_text
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+# body ใหญ่กว่านี้ Flask ตอบ 413 ตั้งแต่ยังไม่อ่านเข้าหน่วยความจำ — ข่าวที่ยาวสุดยังไม่ถึง 100 KB
+app.config["MAX_CONTENT_LENGTH"] = 1_000_000
 # อนุญาตเฉพาะ React frontend (Vite dev server) — เพิ่ม origin อื่นได้ใน CORS_ORIGINS คั่นด้วย ,
 CORS(app, origins=os.environ.get("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(","))
 
@@ -41,11 +46,18 @@ MAX_SUMMARY_INPUT = 20_000  # ตัวอักษร — กันข้อค
 MAX_ASK_CONTEXT = 6_000     # ตัวอักษร (~1,500 token) — เนื้อข่าวที่ส่งไปพร้อมคำถาม (Groq ฟรีจำกัด 8,000 token/นาที)
 MAX_QUESTION = 300
 MAX_TOPICS = 10
+MAX_NEWS_LIMIT = 300        # ข่าวสูงสุดต่อการขอหนึ่งครั้ง — กันการขอทีเดียวจนโควตาอ่าน Firestore หมด
+DEFAULT_NEWS_LIMIT = 100
+# endpoint ที่ใช้โควตา Groq — จำกัดต่อ IP ต่อนาที กันการกดรัวหรือสคริปต์ยิงจนโควตา AI หมดวัน (0 = ปิด)
+AI_RATE_LIMIT = int(os.environ.get("AI_RATE_LIMIT_PER_MIN", "20"))
 FETCH_INTERVAL_MINUTES = float(os.environ.get("FETCH_INTERVAL_MINUTES", "30"))  # 0 = ไม่ดึงข่าวอัตโนมัติ
 # เว็บที่ backend ยอมเปิดหน้าข่าวไปดึงเนื้อหาเต็ม — เฉพาะสำนักข่าวใน RSS_FEEDS
 ARTICLE_HOSTS = {urlparse(f["url"]).hostname for f in RSS_FEEDS}
 
 _groq: GroqService | None = None
+_ai_calls: dict[str, list[float]] = {}   # IP → เวลาที่เรียก AI ในนาทีล่าสุด
+_ai_lock = threading.Lock()
+_MAX_TRACKED_CLIENTS = 1_000
 
 
 def get_groq() -> GroqService:
@@ -64,6 +76,35 @@ def require_token(view):
             return jsonify({"error": "ไม่ได้รับอนุญาต — VITE_API_TOKEN ใน frontend/.env ต้องตรงกับ API_TOKEN ใน backend/.env"}), 401
         return view(*args, **kwargs)
     return wrapper
+
+
+def rate_limit(view):
+    """จำกัดจำนวนครั้งที่ IP หนึ่งเรียก endpoint ที่ใช้โควตา Groq ได้ต่อนาที"""
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        if AI_RATE_LIMIT <= 0:
+            return view(*args, **kwargs)
+        now = time.monotonic()
+        client = request.remote_addr or "unknown"
+        with _ai_lock:
+            recent = [t for t in _ai_calls.get(client, []) if now - t < 60]
+            if len(recent) >= AI_RATE_LIMIT:
+                _ai_calls[client] = recent
+                return jsonify({"error": "เรียก AI ถี่เกินไป รอสักครู่แล้วลองใหม่"}), 429
+            recent.append(now)
+            _ai_calls[client] = recent
+            if len(_ai_calls) > _MAX_TRACKED_CLIENTS:  # กันไม่ให้ dict โตไปเรื่อย ๆ
+                for ip in [ip for ip, hits in _ai_calls.items() if not hits or now - hits[-1] >= 60]:
+                    del _ai_calls[ip]
+        return view(*args, **kwargs)
+    return wrapper
+
+
+def _int_arg(name: str, default: int, max_value: int) -> int:
+    try:
+        return max(1, min(int(request.args[name]), max_value))
+    except (KeyError, TypeError, ValueError):
+        return default
 
 
 def _text(value, max_len: int) -> str:
@@ -99,8 +140,22 @@ def _article_input(data: dict) -> tuple[str, str]:
     title = clean_html(data["title"]) if isinstance(data.get("title"), str) else ""
     content = clean_html(data["content"]) if isinstance(data.get("content"), str) else ""
     if len(content) < SHORT_CONTENT and _can_fetch_text(data.get("source_url")):
-        content = max(content, fetch_article_text(data["source_url"]), key=len)
+        content = max(content, fetch_article_text(data["source_url"], allowed_hosts=ARTICLE_HOSTS), key=len)
     return title, content
+
+
+def _owns_document(doc_id, source_url: str | None) -> bool:
+    """id ที่ client ส่งมาเป็นของข่าวเดียวกับ source_url จริงไหม — กันการเขียนสรุปทับข่าวอื่น
+    ปกติ id = hash ของลิงก์ข่าวจึงเทียบได้เลย ส่วนข่าวที่บันทึกก่อนเปลี่ยนมาใช้ hash มี id แบบสุ่ม ต้องอ่านมาเทียบ"""
+    if not isinstance(doc_id, str) or not doc_id or not source_url:
+        return False
+    if doc_id == article_id(source_url):
+        return True
+    try:
+        return article_source_url(doc_id) == source_url
+    except Exception:
+        logger.exception("ตรวจเจ้าของสรุปไม่สำเร็จ: %s", doc_id)
+        return False
 
 
 def _history(value) -> list[tuple[str, str]]:
@@ -153,8 +208,9 @@ def _article_from_request(data: dict) -> NewsArticle:
 @app.route("/api/news")
 def news():
     category = request.args.get("category") or None
+    limit = _int_arg("limit", DEFAULT_NEWS_LIMIT, MAX_NEWS_LIMIT)
     try:
-        return jsonify({"results": _with_summary_flag(list_articles(category))})
+        return jsonify({"results": _with_summary_flag(list_articles(category, limit)), "limit": limit})
     except Exception:
         logger.exception("โหลดข่าวจาก Firestore ไม่สำเร็จ")
         return jsonify({"error": "โหลดข่าวไม่สำเร็จ ลองใหม่อีกครั้ง"}), 500
@@ -164,7 +220,8 @@ def news():
 # ไม่อ่าน Firestore — frontend เช็กบ่อย ๆ ได้ว่าการดึงข่าวรอบใหม่เสร็จหรือยัง
 @app.route("/api/status")
 def status():
-    return jsonify({"auto_fetch_minutes": FETCH_INTERVAL_MINUTES, "last_fetch": LAST_RUN})
+    return jsonify({"auto_fetch_minutes": FETCH_INTERVAL_MINUTES, "last_fetch": LAST_RUN,
+                    "max_topics": MAX_TOPICS, "max_news_limit": MAX_NEWS_LIMIT})
 
 
 # ── GET /api/briefing ─────────────────────────────────────────────────────────
@@ -180,6 +237,7 @@ def briefing():
 # ── POST /api/briefing ── สร้างสรุปข่าวเด่นใหม่ทันที (ปกติ backend สร้างเองทุก ~3 ชั่วโมง) ──
 @app.route("/api/briefing", methods=["POST"])
 @require_token
+@rate_limit
 def create_briefing():
     try:
         result = briefing_service.generate()
@@ -204,7 +262,11 @@ def search():
     if not keyword:
         return jsonify({"error": "กรุณาพิมพ์คำที่ต้องการค้นหา"}), 400
 
-    results = _with_summary_flag(search_news(keyword))
+    try:
+        results = _with_summary_flag(search_news(keyword))
+    except Exception:
+        logger.exception("ค้นหาข่าวไม่สำเร็จ: %s", keyword)
+        return jsonify({"error": "ค้นหาไม่สำเร็จ ลองใหม่อีกครั้ง"}), 502
     return jsonify({"results": results, "count": len(results)})
 
 
@@ -214,13 +276,18 @@ def search():
 def topics():
     names = [_text(t, 50) for t in request.args.getlist("q")]
     names = list(dict.fromkeys(n for n in names if n))[:MAX_TOPICS]
-    return jsonify({"results": {name: _with_summary_flag(match_feeds(name)) for name in names}})
+    try:
+        return jsonify({"results": {name: _with_summary_flag(match_feeds(name)) for name in names}})
+    except Exception:
+        logger.exception("หาข่าวของหัวข้อที่ติดตามไม่สำเร็จ")
+        return jsonify({"error": "หาข่าวของหัวข้อที่ติดตามไม่สำเร็จ ลองใหม่อีกครั้ง"}), 502
 
 
 # ── POST /api/ask ─────────────────────────────────────────────────────────────
 # body: {"title", "content", "source_url", "question", "history": [{"question", "answer"}, ...]}
 @app.route("/api/ask", methods=["POST"])
 @require_token
+@rate_limit
 def ask():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
@@ -250,6 +317,7 @@ def ask():
 # body: {"title": ..., "content": ..., "id": <doc_id ถ้าเป็นข่าวที่บันทึกแล้ว>}
 @app.route("/api/summarize", methods=["POST"])
 @require_token
+@rate_limit
 def summarize():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
@@ -271,7 +339,8 @@ def summarize():
         logger.exception("สรุปข่าวด้วย Groq ไม่สำเร็จ")
         return jsonify({"error": "AI สรุปข่าวไม่สำเร็จ ลองใหม่อีกครั้ง"}), 502
 
-    if isinstance(data.get("id"), str) and data["id"]:
+    # เขียนสรุปทับได้เฉพาะ document ของข่าวที่ส่งมาจริง ๆ — id จาก client ชี้ไปข่าวอื่นไม่ได้
+    if _owns_document(data.get("id"), _http_url(data.get("source_url"))):
         update_summary(data["id"], summary)
     return jsonify({"summary": summary})
 
@@ -304,6 +373,13 @@ def save():
 @app.route("/api/delete/<doc_id>", methods=["DELETE"])
 @require_token
 def delete(doc_id):
+    try:
+        found = article_exists(doc_id)
+    except Exception:
+        logger.exception("อ่านข่าวก่อนลบไม่สำเร็จ: %s", doc_id)
+        return jsonify({"error": "ลบไม่สำเร็จ ลองใหม่อีกครั้ง"}), 500
+    if not found:
+        return jsonify({"error": "ไม่พบข่าวนี้ — อาจถูกลบไปแล้ว"}), 404
     if delete_article(doc_id):
         return jsonify({"message": "ลบสำเร็จ"}), 200
     return jsonify({"error": "ลบไม่สำเร็จ"}), 500
@@ -311,7 +387,10 @@ def delete(doc_id):
 
 if __name__ == "__main__":
     logger.info("เขียน log ลงไฟล์ %s", setup_logging())
+    host = os.environ.get("API_HOST", "127.0.0.1")
     if not API_TOKEN:
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            raise SystemExit("ตั้ง API_TOKEN ใน backend/.env ก่อน — เปิด API ให้เครื่องอื่นเข้าถึงโดยไม่มี token ไม่ได้")
         logger.warning("ยังไม่ได้ตั้ง API_TOKEN ใน backend/.env — endpoint บันทึก/ลบ/สรุปจะไม่เช็ก token")
     # debug=True เปิด Werkzeug debugger ที่สั่งรันโค้ดบนเครื่องได้ — เปิดเฉพาะตอนพัฒนาด้วย FLASK_DEBUG=1
     # และห้ามใช้คู่กับ API_HOST=0.0.0.0 (คนในวงแลนเดียวกันจะเข้าถึง debugger ได้)
@@ -322,7 +401,7 @@ if __name__ == "__main__":
         if FETCH_INTERVAL_MINUTES > 0:
             start_auto_fetch(FETCH_INTERVAL_MINUTES)
     app.run(
-        host=os.environ.get("API_HOST", "127.0.0.1"),
+        host=host,
         port=5000,
         debug=debug,
     )

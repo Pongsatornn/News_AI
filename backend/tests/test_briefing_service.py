@@ -78,14 +78,14 @@ class BuildBriefingTest(unittest.TestCase):
     def test_generate_saves_and_caches(self):
         with mock.patch.object(bs, "save_briefing") as save, \
              mock.patch.object(bs, "latest_briefing", side_effect=AssertionError("ไม่ควรอ่าน Firestore")):
-            briefing = bs.generate(FakeGroq())
+            briefing = bs.generate(FakeGroq(), NOW)
             self.assertIs(bs.latest(), briefing)
         save.assert_called_once_with(briefing)
 
     def test_generate_runs_one_at_a_time(self):
         with bs._lock:
             with self.assertRaises(bs.BriefingBusyError):
-                bs.generate(FakeGroq())
+                bs.generate(FakeGroq(), NOW)
 
 
 class IsStaleTest(unittest.TestCase):

@@ -6,6 +6,7 @@ import httpx
 from groq import RateLimitError
 
 import api_server
+from models.news_article import article_id
 from services.briefing_service import BriefingBusyError
 from services.groq_service import InsufficientContentError
 
@@ -38,6 +39,7 @@ class ApiTest(unittest.TestCase):
 
     def setUp(self):
         self.client = api_server.app.test_client()
+        api_server._ai_calls.clear()   # ตัวจำกัดจำนวนครั้งนับรวมทั้งโปรเซส — เริ่มใหม่ทุกเทสต์
         for name, value in {"API_TOKEN": TOKEN, "_groq": FakeGroq()}.items():
             patcher = mock.patch.object(api_server, name, value)
             patcher.start()
@@ -96,6 +98,25 @@ class ApiTest(unittest.TestCase):
                 self.assertEqual(self.post("/api/briefing", {}).status_code, status)
         self.assertEqual(self.post("/api/briefing", {}, token=None).status_code, 401)
 
+    def test_news_limit_is_capped(self):
+        cases = [("", api_server.DEFAULT_NEWS_LIMIT), ("?limit=50", 50), ("?limit=9999", api_server.MAX_NEWS_LIMIT),
+                 ("?limit=0", 1), ("?limit=abc", api_server.DEFAULT_NEWS_LIMIT)]
+        for query, expected in cases:
+            with self.subTest(query=query), mock.patch.object(api_server, "list_articles", return_value=[]) as listed:
+                self.client.get(f"/api/news{query}")
+                self.assertEqual(listed.call_args.args[1], expected)
+
+    def test_search_error_is_thai_and_hides_details(self):
+        with mock.patch.object(api_server, "search_news", side_effect=RuntimeError("รายละเอียดภายใน")):
+            res = self.client.get("/api/search?q=AI")
+        self.assertEqual(res.status_code, 502)
+        self.assertNotIn("รายละเอียดภายใน", res.get_json()["error"])
+
+    def test_topics_error_is_thai(self):
+        with mock.patch.object(api_server, "match_feeds", side_effect=RuntimeError("boom")):
+            res = self.client.get("/api/topics?q=AI")
+        self.assertEqual(res.status_code, 502)
+
     def test_search_requires_keyword(self):
         self.assertEqual(self.client.get("/api/search?q=%20").status_code, 400)
 
@@ -141,7 +162,7 @@ class ApiTest(unittest.TestCase):
         with mock.patch.object(api_server, "fetch_article_text", return_value=ARTICLE_TEXT) as fetch:
             res = self.post("/api/ask", {"title": "หัว", "content": "เกริ่นนำ", "source_url": url, "question": "อะไร"})
         self.assertEqual(res.status_code, 200)
-        fetch.assert_called_once_with(url)
+        fetch.assert_called_once_with(url, allowed_hosts=api_server.ARTICLE_HOSTS)
 
     def test_ask_errors(self):
         rate_limited = RateLimitError("rate limited", body=None,
@@ -170,7 +191,7 @@ class ApiTest(unittest.TestCase):
         url = "https://www.thairath.co.th/sport/x/1"
         with mock.patch.object(api_server, "fetch_article_text", return_value="เนื้อหาเต็มจากหน้าข่าว") as fetch:
             self.post("/api/summarize", {"title": "หัว", "content": "เกริ่นนำ", "source_url": url})
-        fetch.assert_called_once_with(url)
+        fetch.assert_called_once_with(url, allowed_hosts=api_server.ARTICLE_HOSTS)
         self.assertEqual(api_server._groq.received, "หัว\nเนื้อหาเต็มจากหน้าข่าว")
 
     def test_summarize_does_not_fetch_other_sites_or_long_articles(self):
@@ -183,10 +204,31 @@ class ApiTest(unittest.TestCase):
                 self.post("/api/summarize", {"title": "หัว", **body})
         fetch.assert_not_called()
 
-    def test_summarize_saves_summary_when_id_given(self):
+    def test_summarize_saves_summary_when_id_matches_the_article(self):
+        url = "https://a.test/1"
         with mock.patch.object(api_server, "update_summary") as update:
-            self.post("/api/summarize", {"id": "doc1", "title": "t", "content": "c"})
-        update.assert_called_once_with("doc1", SUMMARY)
+            self.post("/api/summarize", {"id": article_id(url), "title": "t", "content": "c", "source_url": url})
+        update.assert_called_once_with(article_id(url), SUMMARY)
+
+    def test_summarize_saves_summary_for_old_random_id_articles(self):
+        """ข่าวที่บันทึกก่อนเปลี่ยนมาใช้ hash เป็น id — id ไม่ตรงกับลิงก์ ต้องอ่านมาเทียบก่อน"""
+        url = "https://a.test/1"
+        with mock.patch.object(api_server, "update_summary") as update,              mock.patch.object(api_server, "article_source_url", return_value=url) as stored:
+            self.post("/api/summarize", {"id": "id-สุ่มแบบเก่า", "title": "t", "content": "c", "source_url": url})
+        stored.assert_called_once_with("id-สุ่มแบบเก่า")
+        update.assert_called_once_with("id-สุ่มแบบเก่า", SUMMARY)
+
+    def test_summarize_does_not_write_to_another_document(self):
+        """id ที่ไม่ตรงกับ source_url ที่ส่งมา = เขียนทับสรุปของข่าวอื่น — ต้องไม่บันทึก"""
+        cases = [{"id": "doc-ของข่าวอื่น", "source_url": "https://a.test/1"},
+                 {"id": article_id("https://a.test/1")},  # ไม่ส่ง source_url มาด้วย
+                 {"id": article_id("https://a.test/1"), "source_url": "javascript:alert(1)"}]
+        with mock.patch.object(api_server, "update_summary") as update,              mock.patch.object(api_server, "article_source_url", return_value="https://ข่าว.อื่น/9"):
+            for body in cases:
+                with self.subTest(body=body):
+                    res = self.post("/api/summarize", {"title": "t", "content": "c", **body})
+                    self.assertEqual(res.status_code, 200)   # ยังสรุปให้ แค่ไม่บันทึกลง Firestore
+        update.assert_not_called()
 
     def test_summarize_errors_are_thai(self):
         rate_limited = RateLimitError("rate limited", body=None,
@@ -207,6 +249,33 @@ class ApiTest(unittest.TestCase):
             res = self.post("/api/summarize", {"title": "t", "content": "c"})
         self.assertEqual(res.status_code, 500)
         self.assertIn("GROQ_API_KEY", res.get_json()["error"])
+
+    # ── จำกัดจำนวนครั้งที่เรียก AI ──
+
+    def test_ai_endpoints_are_rate_limited_per_minute(self):
+        with mock.patch.object(api_server, "AI_RATE_LIMIT", 3):
+            replies = [self.post("/api/summarize", {"title": "t", "content": "c"}) for _ in range(4)]
+        self.assertEqual([r.status_code for r in replies], [200, 200, 200, 429])
+        self.assertIn("ถี่เกินไป", replies[-1].get_json()["error"])
+
+    def test_reading_endpoints_are_not_rate_limited(self):
+        with mock.patch.object(api_server, "AI_RATE_LIMIT", 1),              mock.patch.object(api_server, "list_articles", return_value=[]):
+            statuses = [self.client.get("/api/news").status_code for _ in range(3)]
+        self.assertEqual(statuses, [200, 200, 200])
+
+    # ── ลบข่าว ──
+
+    def test_delete(self):
+        with mock.patch.object(api_server, "article_exists", return_value=True),              mock.patch.object(api_server, "delete_article", return_value=True) as remove:
+            res = self.client.delete("/api/delete/doc1", headers={"X-API-Token": TOKEN})
+        self.assertEqual(res.status_code, 200)
+        remove.assert_called_once_with("doc1")
+
+    def test_delete_missing_article_is_404(self):
+        with mock.patch.object(api_server, "article_exists", return_value=False),              mock.patch.object(api_server, "delete_article") as remove:
+            res = self.client.delete("/api/delete/ไม่มีจริง", headers={"X-API-Token": TOKEN})
+        self.assertEqual(res.status_code, 404)
+        remove.assert_not_called()
 
     # ── บันทึกข่าว ──
 

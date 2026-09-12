@@ -11,6 +11,18 @@ class ParseResponseTest(unittest.TestCase):
     def test_returns_bullets(self):
         self.assertEqual(self.groq._parse_response('{"summary": ["ก", "ข", "ค"]}'), ["ก", "ข", "ค"])
 
+    def test_strips_thinking_block(self):
+        """โมเดลแบบคิดก่อนตอบ (qwen3) ใส่ <think> นำหน้า JSON — เคยทำให้สรุปพังทั้งระบบ"""
+        raw = """<think>ผู้ใช้อยากให้สรุปข่าว...</think>
+{"summary": ["ก", "ข"]}"""
+        self.assertEqual(self.groq._parse_response(raw), ["ก", "ข"])
+
+    def test_strips_thinking_block_before_markdown_fence(self):
+        raw = """<think>คิด</think>```json
+{"summary": ["ก"]}
+```"""
+        self.assertEqual(self.groq._parse_response(raw), ["ก"])
+
     def test_strips_markdown_fence(self):
         self.assertEqual(self.groq._parse_response('```json\n{"summary": ["ก"]}\n```'), ["ก"])
 
